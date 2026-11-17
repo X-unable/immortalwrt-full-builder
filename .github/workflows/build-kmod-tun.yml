@@ -1,0 +1,158 @@
+name: Build kmod-tun APK Only
+
+on:
+  workflow_dispatch:
+    inputs:
+      vermagic:
+        description: '目标路由器内核 vermagic 哈希值 (通过 apk list -I kernel 查看)'
+        required: true
+        default: '366a75699c4151bde2ca756ead151790'
+        type: string
+      kernel_subver:
+        description: '目标路由器内核 6.12 小版本号 (例如 6.12.116 则填 116)'
+        required: true
+        default: '116'
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt.git
+  REPO_BRANCH: openwrt-25.12
+  EXPECTED_RELEASE: 25.12.2
+  CONFIG_FILE: full.config
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  TZ: Asia/Shanghai
+
+jobs:
+  build-kmod:
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: 检出当前仓库代码 (Checkout Repository)
+      uses: actions/checkout@v4
+
+    - name: 释放 Runner 磁盘空间 (Free Disk Space)
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force 2>/dev/null || true
+        sudo swapoff -a 2>/dev/null || true
+        sudo rm -f /swapfile 2>/dev/null || true
+        df -h
+
+    - name: 初始化编译环境与依赖 (Initialize Build Environment)
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo sed -i 's/azure\.archive\.ubuntu\.com/archive.ubuntu.com/g' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
+        for i in 1 2 3; do
+          sudo -E apt-get -qq update && break || sleep 3
+        done
+        sudo -E apt-get -qq install -y --fix-missing \
+          ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+          bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext \
+          gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 \
+          libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev \
+          libncurses5-dev libncursesw5-dev libreadline-dev libssl-dev libtool lrzsz \
+          mkisofs msmtp nano ninja-build p7zip p7zip-full patch pkgconf python3 \
+          python3-pip python3-ply python3-docutils qemu-utils re2c rsync scons \
+          squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget \
+          xmlto xxd zlib1g-dev clang llvm libbpf-dev
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+
+    - name: 克隆 ImmortalWrt 源码并对齐内核版本 (Clone Source & Align Kernel)
+      working-directory: /workdir
+      run: |
+        git clone -b $REPO_BRANCH --single-branch $REPO_URL openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+        cd /workdir/openwrt
+
+        SUBVER="${{ github.event.inputs.kernel_subver }}"
+        if ! grep -q "\.${SUBVER}" target/linux/generic/kernel-6.12 include/kernel-6.12 2>/dev/null; then
+          echo "--> 当前分支内核版本非 6.12.${SUBVER}，正在定位对应提交..."
+          commit_hash=$(git log -S ".${SUBVER}" --format="%H" -- target/linux/generic/kernel-6.12 include/kernel-6.12 | head -n 1)
+          if [ -n "$commit_hash" ]; then
+            echo "--> 检出 6.12.${SUBVER} 对应提交: $commit_hash"
+            git checkout "$commit_hash"
+          fi
+        fi
+
+    - name: 加载配置并锁定 vermagic (Configure & Lock vermagic)
+      run: |
+        cd /workdir/openwrt
+        [ -e $GITHUB_WORKSPACE/$DIY_P1_SH ] && chmod +x $GITHUB_WORKSPACE/$DIY_P1_SH && $GITHUB_WORKSPACE/$DIY_P1_SH
+        ./scripts/feeds update -a
+        rm -rf feeds/packages/net/{daed,daede,dae,rtp2httpd,v2ray-geodata}
+        rm -rf feeds/luci/applications/{luci-app-daed,luci-app-daede,luci-app-dae,luci-app-rtp2httpd}
+        ./scripts/feeds install -a
+        rm -rf package/feeds/packages/{daed,daede,dae,rtp2httpd,v2ray-geodata}
+        rm -rf package/feeds/luci/{luci-app-daed,luci-app-daede,luci-app-dae,luci-app-rtp2httpd}
+
+        cp -f "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
+        sed -i -E '/^CONFIG_LINUX_6_[0-9]+=/d' .config
+        sed -i -E '/^CONFIG_FEED_video=/d' .config
+        echo "# CONFIG_FEED_video is not set" >> .config
+        sed -i -E '/^CONFIG_VERSION_NUMBER=/d; /^CONFIG_VERSION_REPO=/d' .config
+        echo "CONFIG_VERSION_NUMBER=\"${EXPECTED_RELEASE}\"" >> .config
+        echo "CONFIG_VERSION_REPO=\"https://downloads.immortalwrt.org/releases/${EXPECTED_RELEASE}\"" >> .config
+
+        # 强制开启 kmod-tun
+        sed -i -E '/CONFIG_PACKAGE_kmod-tun/d' .config
+        echo "CONFIG_PACKAGE_kmod-tun=y" >> .config
+
+        make defconfig
+        [ -e $GITHUB_WORKSPACE/$DIY_P2_SH ] && chmod +x $GITHUB_WORKSPACE/$DIY_P2_SH && $GITHUB_WORKSPACE/$DIY_P2_SH
+
+        # 锁定目标路由器的 vermagic 哈希值
+        TARGET_VERMAGIC="${{ github.event.inputs.vermagic }}"
+        echo "--> 正在锁定内核 vermagic 为: ${TARGET_VERMAGIC}"
+        sed -i "s|> \$(LINUX_DIR)/\.vermagic|> \$(LINUX_DIR)/.vermagic; echo '${TARGET_VERMAGIC}' > \$(LINUX_DIR)/.vermagic|g" include/kernel-defaults.mk
+
+        # 生成 apk 打包所需的本地签名密钥对
+        if [ ! -f private-key.pem ]; then
+          openssl ecparam -name prime256v1 -genkey -noout -out private-key.pem
+          openssl ec -in private-key.pem -pubout > public-key.pem
+        fi
+
+    - name: 仅编译内核与 kmod-tun 安装包 (Compile Kernel & kmod-tun APK)
+      run: |
+        cd /workdir/openwrt
+        TARGET_VERMAGIC="${{ github.event.inputs.vermagic }}"
+
+        echo "--> 1/3 编译基础工具链与内核..."
+        make target/linux/compile -j$(nproc) || make target/linux/compile -j1 V=s
+
+        for d in build_dir/target-*/linux-*/linux-*; do
+          [ -d "$d" ] && echo "${TARGET_VERMAGIC}" > "$d/.vermagic"
+        done
+
+        echo "--> 2/3 编译 apk 打包工具..."
+        make package/system/apk/host/compile -j$(nproc) || true
+
+        echo "--> 3/3 打包生成 kmod-tun.apk..."
+        make package/kernel/linux/compile -j$(nproc) LINUX_VERMAGIC="${TARGET_VERMAGIC}" || \
+          make package/kernel/linux/compile -j1 V=s LINUX_VERMAGIC="${TARGET_VERMAGIC}"
+
+        mkdir -p $GITHUB_WORKSPACE/output-kmod
+        find bin/ -type f -name "kmod-tun*.apk" -exec cp -v {} $GITHUB_WORKSPACE/output-kmod/ \;
+        find build_dir/ -type f -name "tun.ko" -exec cp -v {} $GITHUB_WORKSPACE/output-kmod/ \;
+
+        ls -lh $GITHUB_WORKSPACE/output-kmod/
+        if ! ls $GITHUB_WORKSPACE/output-kmod/kmod-tun*.apk >/dev/null 2>&1; then
+          echo "[ERROR] 未能生成 kmod-tun.apk！" >&2
+          exit 1
+        fi
+
+    - name: 上传 kmod-tun.apk 到 Actions 产物 (Upload Artifact)
+      uses: actions/upload-artifact@v4
+      with:
+        name: kmod-tun-6.12.${{ github.event.inputs.kernel_subver }}-${{ github.event.inputs.vermagic }}
+        path: ${{ github.workspace }}/output-kmod/*
+        retention-days: 30
